@@ -595,6 +595,7 @@ JSC_DEFINE_HOST_FUNCTION(functionHashCode,
     nanoseconds                                    functionBunNanoseconds                                              DontDelete|Function 0
     openInEditor                                   BunObject_callback_openInEditor                                     DontDelete|Function 1
     origin                                         BunObject_getter_wrap_origin                                        DontDelete|PropertyCallback
+    parseArgv                                      BunObject_callback_parseArgv                                        DontDelete|Function 2
     password                                       constructPasswordObject                                             DontDelete|PropertyCallback
     pathToFileURL                                  functionPathToFileURL                                               DontDelete|Function 1
     peek                                           constructBunPeekObject                                              DontDelete|PropertyCallback

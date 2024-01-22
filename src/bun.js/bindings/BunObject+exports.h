@@ -55,6 +55,7 @@
     macro(mmap) \
     macro(nanoseconds) \
     macro(openInEditor) \
+    macro(parseArgv) \
     macro(registerMacro) \
     macro(resolve) \
     macro(resolveSync) \

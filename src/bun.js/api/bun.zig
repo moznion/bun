@@ -30,6 +30,7 @@ pub const BunObject = struct {
     pub const mmap = Bun.mmapFile;
     pub const nanoseconds = Bun.nanoseconds;
     pub const openInEditor = Bun.openInEditor;
+    pub const parseArgv = Bun.parseArgv;
     pub const registerMacro = Bun.registerMacro;
     pub const resolve = Bun.resolve;
     pub const resolveSync = Bun.resolveSync;
@@ -150,6 +151,7 @@ pub const BunObject = struct {
         @export(BunObject.mmap, .{ .name = callbackName("mmap") });
         @export(BunObject.nanoseconds, .{ .name = callbackName("nanoseconds") });
         @export(BunObject.openInEditor, .{ .name = callbackName("openInEditor") });
+        @export(BunObject.parseArgv, .{ .name = callbackName("parseArgv") });
         @export(BunObject.registerMacro, .{ .name = callbackName("registerMacro") });
         @export(BunObject.resolve, .{ .name = callbackName("resolve") });
         @export(BunObject.resolveSync, .{ .name = callbackName("resolveSync") });
@@ -563,6 +565,217 @@ pub fn shellEscape(
     }
 
     return jsval;
+}
+
+pub fn parseArgv(
+    globalThis: *JSC.JSGlobalObject,
+    callframe: *JSC.CallFrame,
+) callconv(.C) JSC.JSValue {
+    const arguments_ = callframe.arguments(2);
+    var arguments = JSC.Node.ArgumentsSlice.init(globalThis.bunVM(), arguments_.slice());
+    defer arguments.deinit();
+
+    const argv = arguments.nextEat() orelse {
+        globalThis.throw("parseArgv: expected at least 1 argument, got 0", .{});
+        return JSC.JSValue.jsUndefined();
+    };
+
+    const argv_num = argv.getLength(globalThis);
+    if (argv_num <= 0) {
+        return JSValue.createEmptyObject(globalThis, 0);
+    }
+
+    const allocator = std.heap.page_allocator;
+
+    var string_forced_flags = std.StringHashMap(bool).init(allocator);
+    defer string_forced_flags.deinit();
+    var boolean_forced_flags = std.StringHashMap(bool).init(allocator);
+    defer boolean_forced_flags.deinit();
+    if (arguments.nextEat()) |opts_val| {
+        const iterator_processor = struct {
+            pub fn fill_flags(
+                _: *JSC.VM,
+                globalObject: *JSGlobalObject,
+                result_flags: ?*anyopaque,
+                flag: JSValue,
+            ) callconv(.C) void {
+                if (!flag.isString()) {
+                    return;
+                }
+                const result_flags_ = bun.cast(*std.StringHashMap(bool), result_flags.?);
+                result_flags_.put(flag.getZigString(globalObject).encode(.utf8), true) catch |err| {
+                    globalObject.throw("parseArgv: failed to ingest the flags option; {}", .{err});
+                };
+            }
+        };
+
+        if (opts_val.isObject()) {
+            if (opts_val.getTruthy(globalThis, "string_flags")) |string_flags_val| {
+                if (string_flags_val.isIterable(globalThis)) {
+                    string_flags_val.forEach(globalThis, &string_forced_flags, iterator_processor.fill_flags);
+                }
+            }
+
+            if (opts_val.getTruthy(globalThis, "boolean_flags")) |boolean_flags_val| {
+                if (boolean_flags_val.isIterable(globalThis)) {
+                    boolean_flags_val.forEach(globalThis, &boolean_forced_flags, iterator_processor.fill_flags);
+                }
+            }
+        }
+    }
+
+    var processing_flags = std.ArrayList(ZigString).init(allocator);
+    defer processing_flags.deinit();
+    var buffers = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (buffers.items) |buffer| {
+            allocator.free(buffer);
+        }
+        buffers.deinit();
+    }
+    var end_of_options_marker_appeared = false;
+
+    const js_args = JSValue.createEmptyArray(globalThis, 0);
+    const flags = JSValue.createEmptyObject(globalThis, 0);
+
+    const processingFlagsBooleanMarker = struct {
+        pub fn mark(globalObj: *JSC.JSGlobalObject, processing_flags_: *std.ArrayList(ZigString), flags_: *const JSC.JSValue) void {
+            for (processing_flags_.items) |processing_flag| {
+                // mark the previous flag as true
+                if (flags_.get(globalObj, processing_flag.encode(.utf8))) |got| {
+                    if (got.isIterable(globalObj)) {
+                        got.push(globalObj, JSC.JSValue.jsBoolean(true));
+                        flags_.put(globalObj, &processing_flag, got);
+                    } else if (!got.isBoolean()) {
+                        const values = JSValue.createEmptyArray(globalObj, 0);
+                        values.push(globalObj, got);
+                        values.push(globalObj, JSC.JSValue.jsBoolean(true));
+                        flags_.put(globalObj, &processing_flag, values);
+                    }
+                } else {
+                    flags_.put(globalObj, &processing_flag, JSC.JSValue.jsBoolean(true));
+                }
+            }
+        }
+    };
+
+    for (0..argv_num) |i| {
+        const js_arg = argv.getIndex(globalThis, @intCast(i));
+
+        if (end_of_options_marker_appeared) {
+            js_args.push(globalThis, js_arg);
+            continue;
+        }
+
+        var arg = js_arg.getZigString(globalThis);
+
+        if (arg.hasPrefix(ZigString.fromBytes("--"))) {
+            processingFlagsBooleanMarker.mark(globalThis, &processing_flags, &flags);
+
+            processing_flags.resize(0) catch |err| {
+                globalThis.throw("parseArgv: failed clearing the flags; {}", .{err});
+                return JSC.JSValue.jsUndefined();
+            };
+            if (arg.eql(ZigString.fromBytes("--"))) {
+                end_of_options_marker_appeared = true;
+            } else {
+                processing_flags.append(arg.substring(2)) catch {
+                    globalThis.throwOutOfMemory();
+                    return JSC.JSValue.jsUndefined();
+                };
+            }
+            continue;
+        }
+
+        if (arg.hasPrefixChar('-')) {
+            processingFlagsBooleanMarker.mark(globalThis, &processing_flags, &flags);
+
+            processing_flags.resize(0) catch {
+                globalThis.throwOutOfMemory();
+                return JSC.JSValue.jsUndefined();
+            };
+            for (arg.substring(1).slice()) |c| {
+                const buffer = allocator.alloc(u8, 1) catch {
+                    globalThis.throw("parseArgv: failed to allocate memory", .{});
+                    return JSC.JSValue.jsUndefined();
+                };
+                buffer[0] = c;
+
+                buffers.append(buffer) catch {
+                    globalThis.throwOutOfMemory();
+                    return JSC.JSValue.jsUndefined();
+                };
+
+                processing_flags.append(ZigString.fromBytes(buffer)) catch {
+                    globalThis.throwOutOfMemory();
+                    return JSC.JSValue.jsUndefined();
+                };
+            }
+            continue;
+        }
+
+        // it processes a non-flag value
+
+        const stacked_processing_flags_len = processing_flags.items.len;
+        if (stacked_processing_flags_len > 0) {
+            // push flag value
+            for (0..stacked_processing_flags_len) |idx| {
+                const processing_flag = processing_flags.items[idx];
+
+                var arg_to_put = js_arg; // JS string value
+                if (idx != stacked_processing_flags_len - 1) {
+                    // for example: `-abc foo` should be like the following;
+                    // {
+                    //     a: true,
+                    //     b: true,
+                    //     c: "foo"
+                    // }
+                    arg_to_put = JSC.JSValue.jsBoolean(true);
+                } else if (boolean_forced_flags.contains(processing_flag.encode(.utf8))) {
+                    arg_to_put = JSC.JSValue.jsBoolean(true);
+                    js_args.push(globalThis, js_arg); // non-flag value must be the argument
+                } else if (!string_forced_flags.contains(processing_flag.encode(.utf8))) {
+                    if (std.fmt.parseFloat(f64, arg.encode(.utf8))) |num_arg| {
+                        arg_to_put = JSC.JSValue.jsNumber(num_arg);
+                    } else |_| {
+                        // NOP: keep string value
+                    }
+                }
+
+                if (flags.get(globalThis, processing_flag.encode(.utf8))) |got| {
+                    if (got.isIterable(globalThis)) {
+                        got.push(globalThis, arg_to_put);
+                        flags.put(globalThis, &processing_flag, got);
+                    } else {
+                        const values = JSValue.createEmptyArray(globalThis, 0);
+                        values.push(globalThis, got);
+                        values.push(globalThis, arg_to_put);
+                        flags.put(globalThis, &processing_flag, values);
+                    }
+                } else {
+                    flags.put(globalThis, &processing_flag, arg_to_put);
+                }
+            }
+
+            processing_flags.resize(0) catch {
+                globalThis.throwOutOfMemory();
+                return JSC.JSValue.jsUndefined();
+            };
+            continue;
+        }
+
+        // push a plain argument
+        js_args.push(globalThis, js_arg);
+    }
+
+    // clean up the trailing flags.
+    processingFlagsBooleanMarker.mark(globalThis, &processing_flags, &flags);
+
+    const result = JSValue.createEmptyObject(globalThis, 2);
+    result.put(globalThis, ZigString.static("arguments"), js_args);
+    result.put(globalThis, ZigString.static("flags"), flags);
+
+    return result;
 }
 
 pub fn braces(

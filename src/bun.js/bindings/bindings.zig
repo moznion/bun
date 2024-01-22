@@ -259,6 +259,30 @@ pub const ZigString = extern struct {
         return this.slice()[0] == char;
     }
 
+    pub fn hasPrefix(this: ZigString, prefix: ZigString) bool {
+        const len = this.len;
+        const prefix_len = prefix.len;
+
+        if (len < prefix_len) {
+            return false;
+        }
+
+        const should_compare_with_16bit = this.is16Bit() and prefix.is16Bit();
+
+        for (0..prefix_len) |i| {
+            if (should_compare_with_16bit) {
+                if (this.utf16SliceAligned()[i] != prefix.utf16SliceAligned()[i]) {
+                    return false;
+                }
+            } else {
+                if (this.slice()[i] != prefix.slice()[i]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     pub fn substringWithLen(this: ZigString, start_index: usize, end_index: usize) ZigString {
         if (this.is16Bit()) {
             return ZigString.from16SliceMaybeGlobal(this.utf16SliceAligned()[start_index..end_index], this.isGloballyAllocated());
